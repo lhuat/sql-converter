@@ -19,3 +19,9 @@
 ## 与数据库版本的关系
 
 当前实现的是通用离线转换子集，**不是完整的 openGauss B 模式/Dolphin 方言解析器**。不能根据目标类型名称就断言目标版本支持该 SQL。后续可增加版本适配配置（按版本、兼容模式启用规则）和真实数据库集成测试。切勿把“单元测试通过”当作“Navicat 可直接生产执行”的证明。
+
+## 表达式联合唯一索引注意事项
+
+MySQL `UNIQUE INDEX (tenant_id, project_code, ((CASE WHEN (del_flag = 0) THEN 1 ELSE NULL END)))` 对应 openGauss 的 **CREATE UNIQUE INDEX**，而不是 `ALTER TABLE ... ADD UNIQUE CONSTRAINT`（后者不能包含表达式）。当前仅转换经测试的简单数值比较 + `THEN` 数值 + `ELSE NULL` 模式；其他表达式继续阻断并要求新增规则。
+
+涉及 `utf8mb4_general_ci` 等大小写不敏感排序规则的业务唯一索引，需要在目标库验证 collation/大小写行为。无需阻断 SQL 生成，但绝不能把 `READY_FOR_TESTING` 理解成已证明数据唯一性规则完全一致。

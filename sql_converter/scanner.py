@@ -11,6 +11,8 @@ import re
 class Statement:
     sql: str
     line: int
+    too_large: bool = False
+    unterminated: bool = False
 
 
 def split_sql(text: str) -> list[Statement]:
@@ -126,43 +128,110 @@ def matched_paren(text: str, begin: int) -> int:
     return -1
 
 
+# Event-based identifier replacement avoids Python loops over long INSERT bodies.
+_ID_EVENTS = {
+    'mysql_to_opengauss': re.compile(r"[`'/-]"),
+    'opengauss_to_mysql': re.compile(r'["\'/-]'),
+}
+_SINGLE_EVENTS = re.compile(r"['\\]")
+
+
 def convert_identifier_quotes(sql: str, direction: str) -> str:
-    """Only identifier delimiters change; quoted literals/comments are untouched."""
-    source, target = ('`','"') if direction == 'mysql_to_opengauss' else ('"','`')
+    """Change only identifier quotes; never replace tokens inside strings/comments."""
+    source, target = ('`', '"') if direction == 'mysql_to_opengauss' else ('"', '`')
+    if source not in sql:
+        return sql
     out: list[str] = []
-    i = 0
+    pos = 0
+    n = len(sql)
     state = 'normal'
-    while i < len(sql):
-        c = sql[i]; nxt = sql[i+1] if i + 1 < len(sql) else ''
+    events = _ID_EVENTS[direction]
+    while pos < n:
         if state == 'normal':
-            if c == "'": state = 'single'; out.append(c)
-            elif c == source: state = 'identifier'; out.append(target)
-            elif c == '-' and nxt == '-' and (i+2 == len(sql) or sql[i+2].isspace()):
-                state='line_comment'; out.extend([c,nxt]); i += 1
+            m = events.search(sql, pos)
+            if m is None:
+                out.append(sql[pos:])
+                break
+            x = m.start()
+            out.append(sql[pos:x])
+            c = sql[x]
+            nxt = sql[x + 1] if x + 1 < n else ''
+            if c == "'":
+                out.append(c)
+                state = 'single'
+                pos = x + 1
+            elif c == source:
+                out.append(target)
+                state = 'identifier'
+                pos = x + 1
+            elif c == '-' and nxt == '-' and (x + 2 == n or sql[x + 2].isspace()):
+                out.append('--')
+                state = 'line_comment'
+                pos = x + 2
             elif c == '/' and nxt == '*':
-                state='block_comment'; out.extend([c,nxt]); i += 1
-            else: out.append(c)
+                out.append('/*')
+                state = 'block_comment'
+                pos = x + 2
+            else:
+                out.append(c)
+                pos = x + 1
         elif state == 'single':
-            out.append(c)
-            if c == '\\' and i+1 < len(sql): i+=1; out.append(sql[i])
-            elif c == "'":
-                if nxt == "'": i+=1; out.append(nxt)
-                else: state='normal'
+            m = _SINGLE_EVENTS.search(sql, pos)
+            if m is None:
+                out.append(sql[pos:])
+                break
+            x = m.start()
+            out.append(sql[pos:x])
+            c = sql[x]
+            nxt = sql[x + 1] if x + 1 < n else ''
+            if c == '\\' and x + 1 < n:
+                out.append(sql[x:x + 2])
+                pos = x + 2
+            elif c == "'" and nxt == "'":
+                out.append("''")
+                pos = x + 2
+            else:
+                out.append(c)
+                pos = x + 1
+                if c == "'":
+                    state = 'normal'
         elif state == 'identifier':
-            if c == source:
-                if nxt == source:
-                    out.append(target); i += 1  # SQL identifier escaped delimiter
-                else: out.append(target); state='normal'
-            elif c == target:
-                out.append(target + target)  # escape a literal target character in identifier
-            else: out.append(c)
+            x = sql.find(source, pos)
+            # A literal target quote in an identifier must be escaped.
+            y = sql.find(target, pos)
+            candidates = [a for a in (x, y) if a >= 0]
+            if not candidates:
+                out.append(sql[pos:])
+                break
+            i = min(candidates)
+            out.append(sql[pos:i])
+            if sql[i] == source:
+                if i + 1 < n and sql[i + 1] == source:
+                    out.append(target)
+                    pos = i + 2
+                else:
+                    out.append(target)
+                    pos = i + 1
+                    state = 'normal'
+            else:
+                out.append(target * 2)
+                pos = i + 1
         elif state == 'line_comment':
-            out.append(c)
-            if c == '\n': state='normal'
-        elif state == 'block_comment':
-            out.append(c)
-            if c == '*' and nxt == '/': i+=1; out.append(nxt); state='normal'
-        i += 1
+            end = sql.find('\n', pos)
+            if end < 0:
+                out.append(sql[pos:])
+                break
+            out.append(sql[pos:end + 1])
+            pos = end + 1
+            state = 'normal'
+        else:
+            end = sql.find('*/', pos)
+            if end < 0:
+                out.append(sql[pos:])
+                break
+            out.append(sql[pos:end + 2])
+            pos = end + 2
+            state = 'normal'
     return ''.join(out)
 
 

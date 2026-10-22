@@ -97,9 +97,10 @@ class SqlConverterTests(unittest.TestCase):
         sql, report = convert_text('INSERT INTO t VALUES (0xAA);', 'mysql_to_opengauss')
         self.assertFalse(report.ready)
 
-    def test_backslash_string_blocked(self):
+    def test_backslash_string_rewritten_safely(self):
         sql, report = convert_text(r"INSERT INTO t VALUES ('a\nb');", 'mysql_to_opengauss')
-        self.assertFalse(report.ready)
+        self.assertTrue(report.ready)
+        self.assertIn(r"E'a\nb'", sql)
 
     def test_prefix_index_blocked(self):
         src = 'CREATE TABLE `t` (`v` VARCHAR(255), KEY `idx` (`v`(10))) ENGINE=InnoDB;'
@@ -220,3 +221,81 @@ class SafetyRegressionTests(unittest.TestCase):
     def test_complex_create_index_blocks(self):
         out, report = convert_text('CREATE INDEX "idx" ON "t" (lower("name"));', 'opengauss_to_mysql')
         self.assertFalse(report.ready)
+
+
+class NavicatRegressionTests(unittest.TestCase):
+    """Synthetic cases modeled on MySQL 8 / Navicat exports; no production data."""
+
+    def test_mysql_navicat_project_with_expression_unique_index(self):
+        source = '''
+SET NAMES utf8mb4;
+SET FOREIGN_KEY_CHECKS = 0;
+DROP TABLE IF EXISTS `td_project`;
+CREATE TABLE `td_project` (
+ `id` bigint NOT NULL COMMENT '主键ID',
+ `tenant_id` bigint NOT NULL COMMENT '租户ID',
+ `project_code` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '项目编码',
+ `del_flag` smallint NOT NULL DEFAULT 0 COMMENT '删除标记',
+ PRIMARY KEY (`id`) USING BTREE,
+ UNIQUE INDEX `uk_td_project_tenant_code` (`tenant_id` ASC, `project_code` ASC, ((case when (`del_flag` = 0) then 1 else NULL end)) ASC) USING BTREE
+) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_general_ci COMMENT = '项目表' ROW_FORMAT = DYNAMIC;
+INSERT INTO `td_project` VALUES (1, 10, 'b', 0);
+INSERT INTO `td_project` VALUES (2, 10, '测试', 1);
+SET FOREIGN_KEY_CHECKS = 1;
+'''
+        output, report = convert_text(source, 'mysql_to_opengauss')
+        self.assertTrue(report.ready, [(f.code, f.message) for f in report.findings])
+        self.assertEqual(report.blocked, 0)
+        self.assertEqual(output.count('INSERT INTO'), 2)
+        self.assertIn('PRIMARY KEY ("id")', output)
+        self.assertIn('CREATE UNIQUE INDEX "uk_td_project_tenant_code"', output)
+        self.assertIn('(CASE WHEN ("del_flag" = 0) THEN 1 ELSE NULL END)', output)
+        self.assertIn('COMMENT ON COLUMN "td_project"."project_code"', output)
+        self.assertIn('COMMENT ON TABLE "td_project"', output)
+        self.assertNotIn('CHARACTER SET =', output)
+        self.assertNotIn('USING BTREE', output)
+        self.assertTrue(any(f.code == 'COLLATION_REVIEW' for f in report.findings))
+        self.assertFalse(any(f.code == 'BINARY_LITERAL' for f in report.findings))
+
+    def test_string_b_does_not_look_like_mysql_binary(self):
+        output, report = convert_text("INSERT INTO `t` VALUES ('b', 'station');", 'mysql_to_opengauss')
+        self.assertTrue(report.ready)
+        self.assertIn("'b', 'station'", output)
+
+    def test_actual_bit_literal_still_blocked(self):
+        _, report = convert_text("INSERT INTO `t` VALUES (B'1010');", 'mysql_to_opengauss')
+        self.assertFalse(report.ready)
+        self.assertTrue(any(f.code == 'BINARY_LITERAL' for f in report.findings))
+
+    def test_quote_inside_single_literal_does_not_block(self):
+        output, report = convert_text('INSERT INTO `t` VALUES (\'a "quoted" word\');', 'mysql_to_opengauss')
+        self.assertTrue(report.ready)
+        self.assertIn('a "quoted" word', output)
+
+    def test_duplicate_collation_warnings_collapsed(self):
+        query = "CREATE TABLE `t` (`a` varchar(10) CHARACTER SET utf8mb4, `b` varchar(12) COLLATE utf8mb4_general_ci);"
+        _, report = convert_text(query, 'mysql_to_opengauss')
+        self.assertEqual(len([f for f in report.findings if f.code == 'COLLATION_REVIEW']), 1)
+
+    def test_unused_mapping_no_spurious_warning(self):
+        _, report = convert_text('CREATE TABLE `t` (`id` INT);', 'mysql_to_opengauss',
+                                 {'TINYINT(n) UNSIGNED': 'NUMERIC(20,0)'})
+        self.assertTrue(report.ready)
+        self.assertFalse(any(f.code == 'CUSTOM_MAPPING' for f in report.findings))
+
+    def test_custom_filename_and_collision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inp = root / 'input.sql'
+            inp.write_text('CREATE TABLE `a` (`id` int);', encoding='utf-8')
+            first, first_report, _ = convert_file(inp, root, 'mysql_to_opengauss', output_name='my-new-name.sql')
+            second, _, _ = convert_file(inp, root, 'mysql_to_opengauss', output_name='my-new-name.sql')
+            self.assertEqual(first.name, 'my-new-name.sql')
+            self.assertEqual(second.name, 'my-new-name_2.sql')
+            self.assertEqual(first_report.name, 'my-new-name_report.json')
+
+    def test_path_in_filename_rejected(self):
+        from sql_converter.engine import validate_output_name
+        for name in ('../hack.sql', 'folder\\hack.sql', 'bad?.sql', 'illegal.txt'):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                validate_output_name(name)
