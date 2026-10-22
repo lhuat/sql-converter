@@ -17,6 +17,7 @@
 - GitHub Actions 自动运行单元测试并打包 Windows EXE。
 - **文件最大 500 MiB：采用流式解析和增量输出；单条 SQL 的内存安全上限为 32 MiB，支持进度、取消及临时文件清理。**
 - **v2.2：采用已确认的统一网格布局、白/灰交替表格和同色下拉框，并增强 OpenGauss → MySQL 的备注、索引、字段精度、转义字符串及 BYTEA 数据转换。**
+- **v2.3：修复三个卡片标题与边框重叠，缩小结果区底部留白，并在 Windows 构建中增加 GUI 布局测试。**
 
 ## 使用方式（电脑**不需要**安装 Python）
 
@@ -157,3 +158,8 @@ python -m benchmarks.benchmark_conversion --size-mib 20
 ## v2.2 注意事项
 
 请阅读 [`UPDATE_V2_2.md`](UPDATE_V2_2.md)，尤其注意目标 **MySQL 8.0.13+ 函数索引**、MySQL 8.0.16+ CHECK 约束行为、OpenGauss BYTEA 数据编码、JSONB 语义、无界 NUMERIC 和时区类型。工具对无法保证数据/约束语义的差异阻断，不以“无错误”替代真实测试验证。
+
+
+## v2.3 GUI 布局修复
+
+参见 [UPDATE_V2_3.md](UPDATE_V2_3.md)。本次只调整界面布局与文字，不修改 SQL 解析/转换引擎。

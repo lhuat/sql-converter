@@ -7,7 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal, Slot, QStandardPaths
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QCompleter, QFileDialog, QFormLayout, QFrame, QGroupBox,
+    QApplication, QComboBox, QCompleter, QFileDialog, QFrame,
     QHBoxLayout, QGridLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QScrollArea, QLayout,
     QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
@@ -28,9 +28,9 @@ DESTINATION_TYPES = [
 STYLE = """
 QWidget { font-family: 'Microsoft YaHei', 'Segoe UI'; font-size: 12px; color: #243247; }
 QMainWindow, QWidget#root { background: #F5F7FB; }
-QGroupBox { font-size: 13px; font-weight: 600; background: white;
-            border: 1px solid #E3E8F0; border-radius: 9px; margin-top: 15px; padding: 8px; }
-QGroupBox::title { subcontrol-origin: margin; left: 14px; padding: 1px 6px; }
+QFrame#sectionCard { background: white; border: 1px solid #E3E8F0; border-radius: 9px; }
+QLabel#sectionTitle { color: #243247; font-size: 13px; font-weight: 700; background: transparent; }
+
 QLineEdit, QComboBox, QPlainTextEdit, QTableWidget {
     border: 1px solid #DDE4EE; background: #FFFFFF; border-radius: 6px;
     padding: 5px; selection-background-color: #D7E8FF; }
@@ -104,10 +104,38 @@ class Window(QMainWindow):
         self._setup_ui()
         self._fill_mappings()
 
+    @staticmethod
+    def _make_section(heading: str, name: str) -> tuple[QFrame, QVBoxLayout]:
+        """A real header row avoids QGroupBox's platform/DPI-dependent title overlap."""
+        card = QFrame()
+        card.setObjectName('sectionCard')
+        card.setProperty('section', name)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(0, 0, 0, 0)
+        card_layout.setSpacing(0)
+
+        header = QWidget(card)
+        header.setObjectName('sectionHeader')
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(14, 11, 14, 7)
+        header_layout.setSpacing(0)
+        title = QLabel(heading)
+        title.setObjectName('sectionTitle')
+        header_layout.addWidget(title)
+        header_layout.addStretch(1)
+        card_layout.addWidget(header)
+
+        body = QWidget(card)
+        body.setObjectName('sectionBody')
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(14, 8, 14, 11)
+        body_layout.setSpacing(8)
+        card_layout.addWidget(body)
+        return card, body_layout
+
     def _setup_ui(self):
-        # The old one-piece expanding layout could compress group boxes until
-        # labels overlapped the mapping table. A scroll viewport prevents this
-        # on small / scaled Windows displays while keeping controls usable.
+        # Scrolling works at low resolutions / Windows scaling without moving a
+        # QGroupBox title into the input widgets (a recurrent Qt style issue).
         viewport = QScrollArea(self)
         viewport.setWidgetResizable(True)
         viewport.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -118,20 +146,20 @@ class Window(QMainWindow):
         layout = QVBoxLayout(root)
         layout.setSizeConstraint(QLayout.SetMinimumSize)
         layout.setSpacing(15)
-        layout.setContentsMargins(20, 15, 20, 20)
+        layout.setContentsMargins(20, 15, 20, 14)
+
         title = QLabel('SQL 转换工具')
         title.setStyleSheet('font-size: 22px; font-weight: 700;')
-        subtitle = QLabel('MySQL ↔ OpenGauss  ·  本地离线转换  ·  无法安全处理的语法会记录在诊断报告中')
+        subtitle = QLabel('MySQL ↔ OpenGauss  ·  本地离线转换  ·  无法安全转换的语法将记录在诊断报告中')
         subtitle.setObjectName('subtitle')
         layout.addWidget(title)
         layout.addWidget(subtitle)
 
-        files = QGroupBox('文件与转换方向')
-        file_grid = QGridLayout(files)
-        file_grid.setContentsMargins(14, 20, 14, 14)
+        files, files_body = self._make_section('文件与转换方向', 'files')
+        file_grid = QGridLayout()
+        file_grid.setContentsMargins(0, 0, 0, 0)
         file_grid.setHorizontalSpacing(10)
         file_grid.setVerticalSpacing(10)
-        # All first-column labels and text controls share the same x origin.
         file_grid.setColumnMinimumWidth(0, 90)
         file_grid.setColumnStretch(1, 3)
         file_grid.setColumnStretch(3, 2)
@@ -184,10 +212,10 @@ class Window(QMainWindow):
         file_grid.addWidget(caption('输出文件名'), 3, 0)
         file_grid.addWidget(self.output_name_line, 3, 1, 1, 3)
         file_grid.addWidget(restore_name, 3, 4)
+        files_body.addLayout(file_grid)
         layout.addWidget(files)
 
-        maps = QGroupBox('数据类型映射（目标类型可搜索 / 下拉 / 手动修改）')
-        mv = QVBoxLayout(maps)
+        maps, maps_body = self._make_section('数据类型映射（目标类型可搜索 / 下拉 / 手动修改）', 'mapping')
         tools = QHBoxLayout()
         self.search = QLineEdit()
         self.search.setPlaceholderText('模糊搜索：类型、目标类型或备注（不区分大小写）')
@@ -199,7 +227,7 @@ class Window(QMainWindow):
         tools.addWidget(self.search, 1)
         tools.addWidget(reset_btn)
         tools.addWidget(save_btn)
-        mv.addLayout(tools)
+        maps_body.addLayout(tools)
         self.map_table = QTableWidget(0, 3)
         self.map_table.setHorizontalHeaderLabels(['来源类型', '目标类型（可编辑）', '说明'])
         self.map_table.verticalHeader().setVisible(False)
@@ -208,19 +236,19 @@ class Window(QMainWindow):
         self.map_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.map_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.map_table.setAlternatingRowColors(True)
-        self.map_table.setMinimumHeight(255)
-        self.map_table.setMaximumHeight(255)
+        self.map_table.setFixedHeight(255)
         self.map_table.verticalHeader().setDefaultSectionSize(33)
         self.map_table.setWordWrap(False)
         self.map_table.setStyleSheet('QTableWidget { alternate-background-color: #EDF0F4; background: white; } QTableWidget::item { padding: 2px 7px; }')
-        mv.addWidget(self.map_table)
-        hint = QLabel('映射可临时调整；点击“保存映射配置”后会写入本机用户配置目录。可能丢失精度或语义的转换仍会阻断或提示验证。')
+        maps_body.addWidget(self.map_table)
+        hint = QLabel('映射可临时调整；点击“保存映射配置”后写入本机用户配置目录。可能丢失精度或语义的转换仍会阻断或提示验证。')
         hint.setWordWrap(True)
         hint.setStyleSheet('color: #758398; font-size: 11px;')
-        mv.addWidget(hint)
+        maps_body.addWidget(hint)
         layout.addWidget(maps)
 
         runrow = QHBoxLayout()
+        runrow.setSpacing(10)
         self.run_button = QPushButton('开始转换')
         self.run_button.setObjectName('primary')
         self.run_button.setMinimumWidth(150)
@@ -235,26 +263,28 @@ class Window(QMainWindow):
         runrow.addWidget(self.progress, 1)
         layout.addLayout(runrow)
 
-        layout.addSpacing(12)  # More space between progress bar and report section.
-        results = QGroupBox('转换结果与语法报告')
-        rv = QVBoxLayout(results)
-        rv.setContentsMargins(12, 20, 12, 13)
-        rv.setSpacing(7)
-        self.status = QLabel('请先选择 SQL 文件。报告中的 BLOCKER 表示输出 SQL 仍需人工处理。')
+        # Deliberate gap above the log panel, without unnecessary whitespace
+        # *inside* it. Both the metrics and log text share the same left edge.
+        layout.addSpacing(9)
+        results, results_body = self._make_section('转换结果与语法报告', 'results')
+        results_body.setContentsMargins(14, 5, 14, 9)
+        results_body.setSpacing(5)
+        self.status = QLabel('请先选择 SQL 文件。若报告中出现 BLOCKER，表示存在需要处理的阻断项，不能直接将输出 SQL 作为完整迁移脚本执行。')
         self.status.setWordWrap(True)
         self.status.setStyleSheet('color:#69788D;')
-        rv.addWidget(self.status)
+        results_body.addWidget(self.status)
         self.metrics_label = QLabel('耗时：—    平均处理速度：—')
-        self.metrics_label.setContentsMargins(12, 0, 0, 0)
+        # QPlainTextEdit's left border + text/document padding ≈ 10px.
+        self.metrics_label.setContentsMargins(10, 0, 0, 0)
         self.metrics_label.setStyleSheet('color: #243247;')
-        rv.addWidget(self.metrics_label)
+        results_body.addWidget(self.metrics_label)
         self.report_text = QPlainTextEdit()
         self.report_text.setReadOnly(True)
         self.report_text.setPlaceholderText('完成后显示转换数量、阻断语法的位置以及输出文件路径。')
-        self.report_text.setMinimumHeight(140)
-        self.report_text.setMaximumHeight(230)
-        rv.addWidget(self.report_text, 1)
+        self.report_text.setFixedHeight(116)
+        results_body.addWidget(self.report_text)
         buttons = QHBoxLayout()
+        buttons.setSpacing(8)
         self.open_result = QPushButton('打开结果文件')
         self.open_result.clicked.connect(lambda: self._open(self._result_file))
         self.open_report = QPushButton('查看报告 JSON')
@@ -264,7 +294,7 @@ class Window(QMainWindow):
         buttons.addWidget(self.open_result)
         buttons.addWidget(self.open_report)
         buttons.addStretch()
-        rv.addLayout(buttons)
+        results_body.addLayout(buttons)
         layout.addWidget(results)
         layout.addStretch(1)
 
