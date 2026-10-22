@@ -17,6 +17,7 @@ import tempfile
 import time
 
 from .mysql_compat import normalize_mysql_literals, validate_case_index_expression, LiteralConversionError
+from .pg_compat import normalize_postgres_literals, rewrite_simple_postgres_casts, PostgresLiteralError
 from .mappings import replace_type
 from .streaming import (MAX_SQL_FILE_BYTES, MAX_STATEMENT_BYTES, validate_file_size,
                         detect_encoding, find_unsafe_dump_directive, iter_sql_stream, preflight_sql)
@@ -58,6 +59,10 @@ class Report:
     omitted_findings: int = 0
     metrics: dict[str, float | int] = field(default_factory=dict)
     _seen: set[tuple[str, str, int, str]] = field(default_factory=set, repr=False)
+    # Conversion-only schema cache used for safe COMMENT ON COLUMN reverse DDL.
+    _column_definitions: dict[str, dict[str, str]] = field(default_factory=dict, repr=False)
+    _column_order: dict[str, list[str]] = field(default_factory=dict, repr=False)
+    _binary_columns: dict[str, set[str]] = field(default_factory=dict, repr=False)
 
     @property
     def ready(self) -> bool:
@@ -121,6 +126,7 @@ class Context:
     mappings: dict[str, str]
     report: Report
     line: int
+    binary_hex_output: bool = False
 
     def info(self, code: str, message: str) -> None:
         self.report.add('INFO', code, self.line, message)
@@ -139,7 +145,7 @@ def _no_semicolon(sql: str) -> str:
 _MASK_EVENTS = re.compile(r"['\"`/#-]")
 
 
-def _masked_sql_literals(sql: str) -> str:
+def _masked_sql_literals(sql: str, *, hash_comments: bool = True) -> str:
     """Mask SQL literals/comments in linear time with C-level substring search.
 
     Retains exact string length for token-position checks. The opening double
@@ -185,7 +191,7 @@ def _masked_sql_literals(sql: str) -> str:
             out.append(' '*(end-i))
             out.append('\n')
             pos=end+1
-        elif c == '#':
+        elif c == '#' and hash_comments:
             end=sql.find('\n',i+1)
             if end<0:
                 out.append(' '*(n-i))
@@ -207,15 +213,15 @@ def _masked_sql_literals(sql: str) -> str:
 def _ensure_safe_expressions(sql: str, ctx: Context) -> None:
     # MySQL strings were normalized token-by-token before entering rules.
     # E'' is used to encode backslashes without relying on target session mode.
-    if ctx.direction == 'opengauss_to_mysql' and has_unsafe_string_escapes(sql, ctx.direction):
-        raise UnsupportedSQL('STRING_ESCAPE', '反向转换包含带转义的字符串，请使用专用处理器')
-    code = _masked_sql_literals(sql)
+    code = _masked_sql_literals(sql, hash_comments=(ctx.direction == 'mysql_to_opengauss'))
     if re.search(r'\b0x[0-9a-f]+\b', code, re.I):
         raise UnsupportedSQL('BINARY_LITERAL', '十六进制数字字面量需要专用转换规则')
     # Check only prefixes in executable SQL; do not mistake the string 'b'
     # for a MySQL bit literal B'101'.
     for match in re.finditer(r"\b[XB](?=\s*')", sql, re.I):
         if code[match.start()] != ' ':
+            if ctx.direction == 'opengauss_to_mysql' and ctx.binary_hex_output and match.group().upper() == 'X':
+                continue
             raise UnsupportedSQL('BINARY_LITERAL', '二进制或十六进制字面量需要专用转换规则')
     if ctx.direction == 'mysql_to_opengauss' and '"' in code:
         # Distinguish executable double quotes from a harmless double-quote
@@ -227,6 +233,11 @@ def _ensure_safe_expressions(sql: str, ctx: Context) -> None:
         raise UnsupportedSQL('PG_CAST', 'PostgreSQL 风格类型强制转换需要专用规则')
     if re.search(r'\$[A-Za-z_0-9]*\$', code):
         raise UnsupportedSQL('DOLLAR_QUOTE', '包含 dollar-quoted SQL 代码块')
+    if ctx.direction == 'opengauss_to_mysql':
+        if re.search(r'\b(?:ILIKE|SIMILAR\s+TO|IS\s+(?:NOT\s+)?DISTINCT\s+FROM)\b|'
+                     r'\b(?:ARRAY\s*\[|ANY\s*\(|ALL\s*\()|\|\||@>|<@|#>>?|->>?|'
+                     r'(?<![<>!])~\*?', code, re.I):
+            raise UnsupportedSQL('PG_DIALECT_OPERATOR', '存在 OpenGauss 专有比较、JSON、正则或数组运算符，不能直接照搬 MySQL')
 
 
 def _convert_mysql_index_columns(fields: str, ctx: Context) -> tuple[str, bool]:
@@ -448,8 +459,9 @@ class CreateTableRule(Rule):
             if not m:
                 raise UnsupportedSQL('COLUMN_PARSE', f'无法解析字段定义：{elem[:80]}')
             col, attr = m.groups()
-            if re.search(r'\b(?:TIMESTAMP|TIME)\s+WITH\s+TIME\s+ZONE\b', attr, re.I):
+            if re.search(r'\b(?:TIMESTAMP|TIME)(?:\s*\(\d+\))?\s+WITH\s+TIME\s+ZONE\b', attr, re.I):
                 raise UnsupportedSQL('TIMEZONE_TYPE', '带时区类型到 MySQL 需要业务规则')
+            attr = re.sub(r'\b((?:TIMESTAMP|TIME)(?:\s*\(\d+\))?)\s+WITHOUT\s+TIME\s+ZONE\b', r'\1', attr, flags=re.I)
             if re.search(r'\b(?:ARRAY|COLLATE|GENERATED\s+ALWAYS\s+AS\s*\(|REFERENCES)\b|::', attr, re.I):
                 raise UnsupportedSQL('COLUMN_ATTRIBUTE', '列包含特殊类型或表达式')
             if re.search(r'\b(?:SMALLSERIAL|BIGSERIAL|SERIAL)\b', attr, re.I):
@@ -461,10 +473,79 @@ class CreateTableRule(Rule):
                 ctx.warning('IDENTITY', '生成列的自增模式已转换；需检查 MySQL 主键条件')
             attr, rule = replace_type(attr, ctx.direction, ctx.mappings)
             _report_mapping_usage(ctx, rule)
+            if re.match(r'^(?:NUMERIC|DECIMAL)\b(?!\s*\()', attr, re.I):
+                raise UnsupportedSQL('UNBOUNDED_NUMERIC', '无精度约束的 NUMERIC 无法保证适配 MySQL DECIMAL(最大 65 位，最大 30 位小数)')
+            if re.match(r'^(?:NUMERIC|DECIMAL)\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)', attr, re.I):
+                spec = re.match(r'^(?:NUMERIC|DECIMAL)\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)', attr, re.I)
+                precision, scale = int(spec.group(1)), int(spec.group(2) or 0)
+                if precision > 65 or scale > 30 or scale > precision:
+                    raise UnsupportedSQL('MYSQL_DECIMAL_RANGE', 'NUMERIC/DECIMAL 精度超过 MySQL 的有效范围')
+            char_spec = re.match(r'^(VARCHAR|CHAR)\s*\(\s*(\d+)\s*\)', attr, re.I)
+            if char_spec and ((char_spec.group(1).upper() == 'CHAR' and int(char_spec.group(2)) > 255) or
+                              (char_spec.group(1).upper() == 'VARCHAR' and int(char_spec.group(2)) > 16383)):
+                raise UnsupportedSQL('MYSQL_CHAR_RANGE', '目标 CHAR/VARCHAR 的长度可能超过 MySQL utf8mb4 行存储上限')
+            if re.match(r'^JSON\b', attr, re.I) and re.match(r'^JSONB\b', elem[len(col):].strip(), re.I):
+                ctx.warning('JSONB_SEMANTICS', 'JSONB 转 JSON：键顺序、重复键与数字表示可能与来源不一致')
             if not rule and not SAFE_GENERIC_TYPES.match(attr):
                 raise UnsupportedSQL('UNMAPPED_TYPE', f'目标类型未支持：{attr[:70]}')
-            cols.append(f'{_identifier(col, ctx)} {ctx.quotes(attr)}')
+
+            col_sql = _identifier(col, ctx)
+            table_key = ctx.quotes(tbl).casefold()
+            ctx.report._column_order.setdefault(table_key, []).append(col_sql.casefold())
+            if re.match(r'^BYTEA\b', elem[len(col):].strip(), re.I):
+                ctx.report._binary_columns.setdefault(table_key, set()).add(col_sql.casefold())
+            attr_sql = ctx.quotes(attr)
+            cols.append(f'{col_sql} {attr_sql}')
+            table_key = ctx.quotes(tbl).casefold()
+            ctx.report._column_definitions.setdefault(table_key, {})[col_sql.casefold()] = attr_sql
+        for column_def in cols:
+            if re.search(r'\bAUTO_INCREMENT\b', column_def, re.I):
+                name_match = re.match(r'(`(?:[^`]|``)+`|[\w$]+)\s+', column_def)
+                col_name = name_match.group(1) if name_match else ''
+                other_keys = any(re.search(r'\b(?:PRIMARY\s+KEY|UNIQUE)\b', entry, re.I)
+                                 and col_name in entry for entry in cols)
+                self_key = re.search(r'\b(?:PRIMARY\s+KEY|UNIQUE)\b', column_def, re.I)
+                if not (other_keys or self_key):
+                    raise UnsupportedSQL('MYSQL_IDENTITY_KEY', 'MySQL AUTO_INCREMENT 列必须建立索引；源列没有可确认的索引')
         return ctx.quotes(header) + ' (\n    ' + ',\n    '.join(cols) + '\n);'
+
+
+class CommentRule(Rule):
+    """Restore openGauss COMMENT ON metadata as MySQL ALTER TABLE DDL.
+
+    For column comments, MODIFY COLUMN needs the *complete* definition.
+    Never emit an incomplete MODIFY COLUMN from a comment alone.
+    """
+    _ident = r'(?:"(?:[^"]|"")+"|[a-zA-Z_][\w$]*)'
+    _table = rf'{_ident}(?:\.{_ident})?'
+
+    def accepts(self, sql: str) -> bool:
+        return bool(re.match(r'^COMMENT\s+ON\s+', sql, re.I))
+
+    def convert(self, sql: str, ctx: Context) -> str:
+        if ctx.direction != 'opengauss_to_mysql':
+            raise UnsupportedSQL('COMMENT_DIALECT', 'MySQL COMMENT ON 语句不能直接输出给 openGauss')
+        # String literals were normalized to MySQL format by the lexer.
+        literal = r"'(?:''|\\.|[^'])*'"
+        s = _no_semicolon(sql)
+        table = re.fullmatch(rf'COMMENT\s+ON\s+TABLE\s+({self._table})\s+IS\s+({literal}|NULL)', s, re.I|re.S)
+        if table:
+            name, comment = table.groups()
+            if comment.upper() == 'NULL': comment = "''"
+            return f'ALTER TABLE {ctx.quotes(name)} COMMENT = {comment};'
+        column = re.fullmatch(rf'COMMENT\s+ON\s+COLUMN\s+({self._table})\.({self._ident})\s+IS\s+({literal}|NULL)', s, re.I|re.S)
+        if column:
+            table_name, col_name, comment = column.groups()
+            if comment.upper() == 'NULL': comment = "''"
+            table_key = ctx.quotes(table_name).casefold()
+            col_key = ctx.quotes(col_name).casefold()
+            attr = ctx.report._column_definitions.get(table_key, {}).get(col_key)
+            if attr is None:
+                raise UnsupportedSQL('COMMENT_COLUMN_SCHEMA', '无法取得列的完整类型、默认值和约束，禁止生成可能丢失属性的 MODIFY COLUMN')
+            if re.search(r'\b(?:GENERATED|REFERENCES|AS\s*\()\b', attr, re.I):
+                raise UnsupportedSQL('COMMENT_COLUMN_COMPLEX', '复杂列需要专门的备注迁移规则')
+            return f'ALTER TABLE {ctx.quotes(table_name)} MODIFY COLUMN {ctx.quotes(col_name)} {attr} COMMENT {comment};'
+        raise UnsupportedSQL('COMMENT_FORM', 'COMMENT ON 语句不属于已验证的表备注或列备注格式')
 
 
 class CreateIndexRule(Rule):
@@ -472,15 +553,47 @@ class CreateIndexRule(Rule):
         return bool(re.match(r'^CREATE\s+(?:UNIQUE\s+)?INDEX\s+', sql, re.I))
 
     def convert(self, sql: str, ctx: Context) -> str:
-        if re.search(r'\b(?:CONCURRENTLY|USING\s+(?:GIN|GIST|HASH)|INCLUDE|WHERE)\b', sql, re.I):
-            raise UnsupportedSQL('INDEX_OPTIONS', '特殊索引类型或部分索引需要单独规则')
-        m = re.fullmatch(r'CREATE\s+(?:UNIQUE\s+)?INDEX\s+[`"\w$]+\s+ON\s+[`"\w$.]+\s*\((.+)\)', _no_semicolon(sql), re.I | re.S)
-        if not m:
-            raise UnsupportedSQL('INDEX_FORM', '只支持普通列名组成的 CREATE INDEX')
-        for part in split_top_level(m.group(1)):
-            if not re.fullmatch(r'[`"\w$]+(?:\s+(?:ASC|DESC))?', part, re.I):
-                raise UnsupportedSQL('INDEX_EXPRESSION', '表达式索引、前缀索引或排序规则需要专用规则')
-        return ctx.quotes(_no_semicolon(sql)) + ';'
+        if re.search(r'\b(?:CONCURRENTLY|USING\s+(?:GIN|GIST|HASH)|INCLUDE|TABLESPACE)\b', sql, re.I):
+            raise UnsupportedSQL('INDEX_OPTIONS', '非 BTREE、并发或特殊索引属性需要专用处理器')
+        head = re.match(r'^CREATE\s+(UNIQUE\s+)?INDEX\s+([`"\w$]+)\s+ON\s+([`"\w$.]+)\s*', sql, re.I)
+        if not head:
+            raise UnsupportedSQL('INDEX_FORM', 'CREATE INDEX 头部不符合支持的格式')
+        unique, name, table = head.groups()
+        remainder = _no_semicolon(sql[head.end():]).strip()
+        if remainder.upper().startswith('USING BTREE'):
+            remainder = remainder[11:].strip()
+        if not remainder.startswith('('):
+            raise UnsupportedSQL('INDEX_FORM', '索引缺少字段列表')
+        close = matched_paren(remainder, 0)
+        if close < 0:
+            raise UnsupportedSQL('INDEX_FORM', '索引括号不匹配')
+        fields = remainder[1:close]
+        after = remainder[close+1:].strip()
+        if after:
+            # PostgreSQL partial indexes cannot be directly copied into MySQL.
+            raise UnsupportedSQL('PARTIAL_INDEX', 'WHERE 部分索引不能直接转换为 MySQL 普通索引（可能改变唯一性或索引范围）')
+        columns = []
+        for field in split_top_level(fields):
+            item=field.strip()
+            if re.fullmatch(r'[`"\w$]+(?:\s+(?:ASC|DESC))?',item,re.I):
+                columns.append(ctx.quotes(item))
+                continue
+            if ctx.direction == 'opengauss_to_mysql':
+                m = re.fullmatch(r'(.+?)(?:\s+(ASC|DESC))?',item,re.I|re.S)
+                assert m is not None
+                expr,order=m.groups()
+                # OpenGauss expressions already have parentheses. MySQL 8.0.13+
+                # requires a parenthesized functional key part.
+                try:
+                    normalized = validate_case_index_expression(expr)
+                except LiteralConversionError as exc:
+                    raise UnsupportedSQL('INDEX_EXPRESSION', str(exc)) from exc
+                columns.append(ctx.quotes(normalized) + (' '+order.upper() if order else ''))
+                ctx.warning('MYSQL_FUNCTION_INDEX', '表达式索引需要 MySQL 8.0.13+；请测试与 openGauss 的唯一性和字符序语义')
+            else:
+                raise UnsupportedSQL('INDEX_EXPRESSION', '复杂 CREATE INDEX 尚未支持该转换方向')
+        index_type = 'UNIQUE ' if unique else ''
+        return f'CREATE {index_type}INDEX {_identifier(name,ctx)} ON {_identifier(table,ctx)} (' + ', '.join(columns) + ');'
 
 
 class DropTableRule(Rule):
@@ -558,6 +671,62 @@ class AlterTableRule(Rule):
         return '\n'.join(results)
 
 
+def _rewrite_pg_bytea_insert(sql: str, ctx: Context) -> str:
+    """Convert common pg_dump hex-bytea values to MySQL X'hex' literals.
+
+    When a referenced table contains BYTEA columns, any unrecognized literal
+    causes a blocker instead of silent binary-data corruption. This is
+    intentionally not a general-purpose INSERT parser for arbitrary SQL.
+    """
+    ident = r'(?:`(?:[^`]|``)+`|"(?:[^"]|"")+"|[A-Za-z_][\w$]*)'
+    qualified = rf'{ident}(?:\.{ident})?'
+    head = re.match(rf'^INSERT\s+INTO\s+({qualified})\s*', sql, re.I)
+    if head is None:
+        return sql
+    table = ctx.quotes(head.group(1)).casefold()
+    binary_cols = ctx.report._binary_columns.get(table)
+    if not binary_cols:
+        return sql
+    tail = sql[head.end():]
+    columns = ctx.report._column_order.get(table, [])
+    if tail.startswith('('):
+        end = matched_paren(tail, 0)
+        if end < 0:
+            raise UnsupportedSQL('BYTEA_INSERT_COLUMNS', '二进制 INSERT 列列表未正确闭合')
+        columns = [ctx.quotes(c.strip()).casefold() for c in split_top_level(tail[1:end])]
+        values_start = tail[end+1:]
+        prefix = sql[:head.end()] + tail[:end+1]
+    else:
+        values_start = tail
+        prefix = sql[:head.end()]
+    positions = [i for i,col in enumerate(columns) if col in binary_cols]
+    if not positions:
+        return sql
+    m = re.match(r'^\s*VALUES\s*', values_start, re.I)
+    if not m:
+        raise UnsupportedSQL('BYTEA_INSERT_FORM', '包含 BYTEA 的 INSERT 必须使用 VALUES 语法')
+    tuple_text = _no_semicolon(values_start[m.end():]).strip()
+    rendered=[]
+    for row in split_top_level(tuple_text):
+        row=row.strip()
+        if not row.startswith('(') or matched_paren(row,0) != len(row)-1:
+            raise UnsupportedSQL('BYTEA_INSERT_FORM', 'BYTEA 数据仅支持明确的 VALUES (...), (...) 元组')
+        fields=split_top_level(row[1:-1])
+        for at in positions:
+            if at >= len(fields):
+                raise UnsupportedSQL('BYTEA_INSERT_VALUES', 'INSERT 数据列数不足，无法识别 BYTEA 值')
+            val=fields[at].strip()
+            if val.upper()=='NULL':
+                continue
+            hex_match=re.fullmatch(r"'\\\\x([0-9a-fA-F]*)'", val)
+            if hex_match is None or len(hex_match.group(1)) % 2:
+                raise UnsupportedSQL('BYTEA_INSERT_FORMAT', 'BYTEA 只支持 pg_dump 的 \\x 十六进制格式，其他编码必须专用转换')
+            fields[at] = "X'" + hex_match.group(1).upper() + "'"
+            ctx.binary_hex_output = True
+        rendered.append('(' + ', '.join(fields) + ')')
+    return prefix + values_start[:m.end()] + ', '.join(rendered) + ';'
+
+
 class DmlRule(Rule):
     def accepts(self, sql: str) -> bool:
         return bool(re.match(r'^(?:INSERT|UPDATE|DELETE)\s+', sql, re.I))
@@ -565,15 +734,27 @@ class DmlRule(Rule):
     def convert(self, sql: str, ctx: Context) -> str:
         if SENSITIVE_SQL.search(sql):
             raise UnsupportedSQL('DIALECT_DML', '存在 ON CONFLICT、INSERT IGNORE、RETURNING 等方言特性')
+        if ctx.direction == 'opengauss_to_mysql':
+            sql = rewrite_simple_postgres_casts(sql)
+            if re.match(r'^INSERT\b', sql, re.I):
+                sql = _rewrite_pg_bytea_insert(sql, ctx)
         _ensure_safe_expressions(sql, ctx)
+        object_ident = r'(?:`(?:[^`]|``)+`|"(?:[^"]|"")+"|[A-Za-z_][\w$]*)'
+        qualified = rf'{object_ident}(?:\.{object_ident})?'
         if re.match(r'^INSERT\b', sql, re.I):
-            if not re.match(r'^INSERT\s+INTO\s+[`"\w$.]+\s*(?:\([^;]*?\)\s*)?VALUES\s*\(', sql, re.I | re.S):
+            if not re.match(rf'^INSERT\s+INTO\s+{qualified}\s*(?:\([^;]*?\)\s*)?VALUES\s*\(', sql, re.I | re.S):
                 raise UnsupportedSQL('INSERT_FORM', '仅支持 INSERT INTO ... VALUES (...) 形式')
+        if ctx.direction == 'opengauss_to_mysql':
+            code = _masked_sql_literals(sql, hash_comments=False)
+            if re.match(r'^UPDATE\b', sql, re.I) and re.search(r'\bFROM\s+[`"\w$]', code, re.I):
+                raise UnsupportedSQL('PG_UPDATE_FROM', 'OpenGauss UPDATE ... FROM 与 MySQL JOIN 更新语法不同')
+            if re.match(r'^DELETE\b', sql, re.I) and re.search(r'\bUSING\s+[`"\w$]', code, re.I):
+                raise UnsupportedSQL('PG_DELETE_USING', 'OpenGauss DELETE ... USING 与 MySQL 多表删除语法不同')
         if re.match(r'^UPDATE\b', sql, re.I):
-            if not re.match(r'^UPDATE\s+[`"\w$.]+\s+SET\s+', sql, re.I):
+            if not re.match(rf'^UPDATE\s+{qualified}\s+SET\s+', sql, re.I):
                 raise UnsupportedSQL('UPDATE_FORM', '复杂 UPDATE / JOIN 更新需要专用转换规则')
         if re.match(r'^DELETE\b', sql, re.I):
-            if not re.match(r'^DELETE\s+FROM\s+[`"\w$.]+(?:\s+WHERE\b|\s*$|\s*;)', sql, re.I):
+            if not re.match(rf'^DELETE\s+FROM\s+{qualified}(?:\s+WHERE\b|\s*$|\s*;)', sql, re.I):
                 raise UnsupportedSQL('DELETE_FORM', '复杂 DELETE / JOIN 删除需要专用转换规则')
         return ctx.quotes(_no_semicolon(sql)) + ';'
 
@@ -582,7 +763,7 @@ class DmlRule(Rule):
 # No untrusted plugins are dynamically loaded from user SQL/files.
 RULES: tuple[Rule, ...] = (
     SkipSessionRule(), TransactionRule(), CreateTableRule(), CreateIndexRule(),
-    DropTableRule(), AlterTableRule(), DmlRule()
+    CommentRule(), DropTableRule(), AlterTableRule(), DmlRule()
 )
 
 
@@ -603,9 +784,11 @@ def _process_statement(stmt: Statement, direction: str, mappings: dict[str, str]
     ctx = Context(direction, mappings, report, source_line)
     try:
         if direction == 'mysql_to_opengauss':
-            # Rewrite only SQL string tokens, not comments/identifiers. This
-            # preserves JSON, exception stack traces, and log payload bytes.
             source, _ = normalize_mysql_literals(source)
+        else:
+            # PostgreSQL ordinary strings treat backslash literally, and E''
+            # decodes escapes. Re-encode as MySQL literals before any DDL/DML.
+            source, _ = normalize_postgres_literals(source)
         if stmt.unterminated:
             raise UnsupportedSQL('UNTERMINATED_SQL', 'SQL 文件结束时存在未闭合的字符串、注释或 dollar quote')
         if source.startswith('/*!') and re.match(r'^/\*!\d+\s+SET\b', source, re.I):
@@ -625,7 +808,7 @@ def _process_statement(stmt: Statement, direction: str, mappings: dict[str, str]
         return None
     except (UnsupportedSQL, ValueError) as exc:
         report.blocked += 1
-        code = exc.code if isinstance(exc, UnsupportedSQL) else ('STRING_LITERAL' if isinstance(exc, LiteralConversionError) else 'MAPPING_ERROR')
+        code = exc.code if isinstance(exc, UnsupportedSQL) else ('STRING_LITERAL' if isinstance(exc, (LiteralConversionError, PostgresLiteralError)) else 'MAPPING_ERROR')
         report.add('BLOCKER', code, source_line, str(exc), source[:350])
         return f'-- [BLOCKER] source line {source_line}: {code}\n-- See JSON report for original SQL.'
 
@@ -637,6 +820,10 @@ def convert_text(sql: str, direction: str, mappings: dict[str, str] | None = Non
     src, dst = ('mysql', 'opengauss') if direction == 'mysql_to_opengauss' else ('opengauss', 'mysql')
     report = Report(src, dst, filename)
     output = [f'-- SQLConverter: {src} -> {dst}\n-- STATIC CONVERSION ONLY: 请在对应版本的测试数据库执行并核对字符序与约束，再用于正式环境。\n']
+    if direction == 'opengauss_to_mysql' and re.search(r'(?mi)^\s*SET\s+standard_conforming_strings\s*=\s*(?:off|false|0)\s*;', sql):
+        report.total = report.blocked = 1
+        report.add('BLOCKER', 'PG_STRING_MODE', 1, '脚本禁用了 standard_conforming_strings，不能按默认字符串模式转换')
+        return '-- UNSAFE PostgreSQL string mode; no SQL emitted.\n', report
     if re.search(r'(?mi)^\s*SET\s+[^;\n]*SQL_MODE[^;\n]*NO_BACKSLASH_ESCAPES', sql):
         report.total = report.blocked = 1
         report.add('BLOCKER', 'MYSQL_SQL_MODE', 1, '发现 NO_BACKSLASH_ESCAPES；当前 MySQL 源模式的字符串转义规则不同，已拒绝转换')
@@ -649,7 +836,7 @@ def convert_text(sql: str, direction: str, mappings: dict[str, str] | None = Non
         report.total = report.blocked = 1
         report.add('BLOCKER', 'COPY_STDIN', 1, '包含 COPY FROM STDIN 数据块；请重新导出为 INSERT 格式')
         return '-- COPY STDIN DUMP: no SQL statements emitted. See report.\n', report
-    statements = split_sql(sql)
+    statements = split_sql(sql, postgres_mode=(direction == 'opengauss_to_mysql'))
     count = len(statements)
     for n, stmt in enumerate(statements, start=1):
         result = _process_statement(stmt, direction, mappings or {}, report)
@@ -758,7 +945,8 @@ def convert_file(path: Path, output_dir: Path, direction: str,
                             if percent > last_percent:
                                 last_percent = percent
                                 progress(percent, 100)
-                    for stmt in iter_sql_stream(source, on_chars=update_chars):
+                    for stmt in iter_sql_stream(source, on_chars=update_chars,
+                                                    postgres_mode=(direction == 'opengauss_to_mysql')):
                         if cancel_check and cancel_check():
                             raise ConversionCancelled('用户已取消转换')
                         result = _process_statement(stmt, direction, mappings or {}, report)

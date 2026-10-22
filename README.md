@@ -1,6 +1,6 @@
-# SQL Converter | MySQL ↔ openGauss 桌面转换工具
+# SQL Converter | MySQL ↔ OpenGauss 桌面转换工具
 
-一个无需数据库连接、无需远程后端的 **Windows 离线 SQL 文件转换工具**。桌面界面使用 PySide6，SQL 转换核心仅依赖 Python 标准库。支持 MySQL 与 openGauss 的**保守子集**转换，无法安全转换的语句会在报告中明确标记，不能视为完整迁移成功。
+一个无需数据库连接、无需远程后端的 **Windows 离线 SQL 文件转换工具**。桌面界面使用 PySide6，SQL 转换核心仅依赖 Python 标准库。支持 MySQL 与 OpenGauss 的**保守子集**转换，无法安全转换的语句会在报告中明确标记，不能视为完整迁移成功。
 
 > ⚠️ **请勿将转换结果未经测试就直接导入生产数据库。** `READY_FOR_TESTING` 表示本工具没有检测到已知阻断项，**不表示已通过目标数据库执行验证**。数据库版本、openGauss 兼容模式、Dolphin 插件、字符集、权限以及实际数据可能影响结果。
 
@@ -15,7 +15,8 @@
 - `.sql` 输出及 `*_report.json` 报告：按行号列出 INFO、WARNING、BLOCKER；相同语句的重复排序规则告警会合并，未使用的自定义映射不再产生警告；阻断时输出命名为 `*_review.sql`。
 - 原有输出文件不覆盖，自动追加 `_2`、`_3` 等编号。
 - GitHub Actions 自动运行单元测试并打包 Windows EXE。
-- **v1.2：支持最大 500 MiB 本地 SQL 文件，采用流式解析和增量输出；大文件转换期间可查看进度。**
+- **文件最大 500 MiB：采用流式解析和增量输出；单条 SQL 的内存安全上限为 32 MiB，支持进度、取消及临时文件清理。**
+- **v2.2：采用已确认的统一网格布局、白/灰交替表格和同色下拉框，并增强 OpenGauss → MySQL 的备注、索引、字段精度、转义字符串及 BYTEA 数据转换。**
 
 ## 使用方式（电脑**不需要**安装 Python）
 
@@ -66,6 +67,7 @@ sql_converter/engine.py      # 保守语句处理器 + JSON 报告
 sql_converter/scanner.py     # SQL 分句、括号识别、标识符引号转换
 sql_converter/streaming.py   # 大文件流式解析、500 MiB 限制、文件编码检测
 sql_converter/mappings.py    # 类型模板、默认映射、自定义配置
+sql_converter/pg_compat.py   # OpenGauss 字符串转义和受限 CAST 转换
 samples/                     # 双向转换示例
 tests/                      # 标准库 unittest 测试
 .github/workflows/           # Windows CI 与 PyInstaller EXE 构建
@@ -151,3 +153,7 @@ python -m benchmarks.benchmark_conversion --size-mib 20
 ```
 
 **仍需注意**：500 MiB 是整个 SQL 文件大小上限，单条 SQL **32 MiB** 的安全阈值仍然存在。包含单条超长扩展 INSERT 的 SQL，应重新导出为较小批次；为了性能或“零报错”不应静默拆分有事务或函数副作用的单条语句。`_review.sql` 包含阻断标记，不能直接作为完整迁移脚本执行。自动化测试不替代目标 openGauss / MySQL 的真实导入验证。
+
+## v2.2 注意事项
+
+请阅读 [`UPDATE_V2_2.md`](UPDATE_V2_2.md)，尤其注意目标 **MySQL 8.0.13+ 函数索引**、MySQL 8.0.16+ CHECK 约束行为、OpenGauss BYTEA 数据编码、JSONB 语义、无界 NUMERIC 和时区类型。工具对无法保证数据/约束语义的差异阻断，不以“无错误”替代真实测试验证。

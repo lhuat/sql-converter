@@ -15,7 +15,7 @@ class Statement:
     unterminated: bool = False
 
 
-def split_sql(text: str) -> list[Statement]:
+def split_sql(text: str, *, postgres_mode: bool = False) -> list[Statement]:
     statements: list[Statement] = []
     start = 0
     start_line = 1
@@ -23,6 +23,7 @@ def split_sql(text: str) -> list[Statement]:
     i = 0
     state = 'normal'
     dollar_tag = ''
+    escaped_string = True
     while i < len(text):
         c = text[i]
         nxt = text[i + 1] if i + 1 < len(text) else ''
@@ -31,6 +32,7 @@ def split_sql(text: str) -> list[Statement]:
         if state == 'normal':
             if c == "'":
                 state = 'single'
+                escaped_string = not postgres_mode or (i > 0 and text[i-1] in 'Ee' and (i == 1 or not (text[i-2].isalnum() or text[i-2] in '_$'))) 
             elif c == '"':
                 state = 'double'
             elif c == '`':
@@ -54,7 +56,7 @@ def split_sql(text: str) -> list[Statement]:
                 start_line = line
         elif state in ('single', 'double', 'backtick'):
             quote = {'single':"'", 'double':'"', 'backtick':'`'}[state]
-            if c == '\\' and state in ('single', 'double') and i + 1 < len(text):
+            if c == '\\' and (state == 'single' and escaped_string or state == 'double' and not postgres_mode) and i + 1 < len(text):
                 # MySQL-style escaping. Detect and flag unsafe payloads later.
                 if text[i+1] == '\n':
                     line += 1

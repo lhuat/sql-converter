@@ -58,7 +58,8 @@ def find_unsafe_dump_directive(path: Path, encoding: str) -> tuple[str, str] | N
     patterns = (
         ('DELIMITER_MODE', re.compile(r'(?mi)^\s*DELIMITER\s+\S+')),
         ('COPY_STDIN', re.compile(r'(?mi)^[ \t]*COPY\b')),
-        ('MYSQL_SQL_MODE', re.compile(r'(?mi)^\s*SET\s+[^;\n]*SQL_MODE[^;\n]*NO_BACKSLASH_ESCAPES')), 
+        ('MYSQL_SQL_MODE', re.compile(r'(?mi)^\s*SET\s+[^;\n]*SQL_MODE[^;\n]*NO_BACKSLASH_ESCAPES')),
+        ('PG_STRING_MODE', re.compile(r'(?mi)^\s*SET\s+standard_conforming_strings\s*=\s*(?:off|false|0)\s*;')), 
     )
     carry = ''
     with path.open('r', encoding=encoding, errors='strict', newline='') as handle:
@@ -69,6 +70,7 @@ def find_unsafe_dump_directive(path: Path, encoding: str) -> tuple[str, str] | N
                     return code, ('包含 DELIMITER 客户端指令；为防止拆坏过程体，已终止整个文件转换'
                                   if code == 'DELIMITER_MODE' else
                                   '发现 NO_BACKSLASH_ESCAPES 模式，字符串需要另一套词法解析' if code == 'MYSQL_SQL_MODE' else
+                                  'standard_conforming_strings=off 会改变字符串语义，已拒绝转换' if code == 'PG_STRING_MODE' else
                                   '包含 COPY 客户端导入命令；请重新导出为 INSERT 格式')
             # preserve enough chars to recognize a match crossing a chunk edge
             carry = text[-2048:]
@@ -82,6 +84,7 @@ _UNSAFE_PATTERNS = (
     ('DELIMITER_MODE', re.compile(r'(?mi)^\s*DELIMITER\s+\S+')),
     ('COPY_STDIN', re.compile(r'(?mi)^[ \t]*COPY\b')),
     ('MYSQL_SQL_MODE', re.compile(r'(?mi)^\s*SET\s+[^;\n]*SQL_MODE[^;\n]*NO_BACKSLASH_ESCAPES')),
+        ('PG_STRING_MODE', re.compile(r'(?mi)^\s*SET\s+standard_conforming_strings\s*=\s*(?:off|false|0)\s*;')),
 )
 
 
@@ -112,6 +115,8 @@ def preflight_sql(path: Path, requested: str = 'auto',
                                            if code == 'DELIMITER_MODE' else
                                            '发现 NO_BACKSLASH_ESCAPES 模式，字符串需要另一套词法解析'
                                            if code == 'MYSQL_SQL_MODE' else
+                                           'standard_conforming_strings=off 会改变字符串语义，已拒绝转换'
+                                           if code == 'PG_STRING_MODE' else
                                            '包含 COPY 客户端导入命令；请重新导出为 INSERT 格式')
                                 directive = (code, message)
                                 break
@@ -125,6 +130,8 @@ def preflight_sql(path: Path, requested: str = 'auto',
                                        if code == 'DELIMITER_MODE' else
                                        '发现 NO_BACKSLASH_ESCAPES 模式，字符串需要另一套词法解析'
                                        if code == 'MYSQL_SQL_MODE' else
+                                       'standard_conforming_strings=off 会改变字符串语义，已拒绝转换'
+                                       if code == 'PG_STRING_MODE' else
                                        '包含 COPY 客户端导入命令；请重新导出为 INSERT 格式')
                             directive = (code, message)
                             break
@@ -148,6 +155,7 @@ _DOLLAR_OPEN = re.compile(r'\$[a-zA-Z_0-9]*\$')
 
 
 def iter_sql_stream(handle: TextIO, *, chunk_chars: int = CHUNK_CHARS,
+                    postgres_mode: bool = False,
                     max_statement_bytes: int = MAX_STATEMENT_BYTES,
                     on_chars: Callable[[int], None] | None = None) -> Iterator[Statement]:
     """Yield bounded SQL statements with event-based scanning.
@@ -165,6 +173,7 @@ def iter_sql_stream(handle: TextIO, *, chunk_chars: int = CHUNK_CHARS,
     line = start_line = 1
     state = 'normal'
     dollar_tag = ''
+    escaped_string = True
     parts: list[str] = []
     length = 0
     oversized = False
@@ -208,6 +217,7 @@ def iter_sql_stream(handle: TextIO, *, chunk_chars: int = CHUNK_CHARS,
                 line += 1
             elif c == "'":
                 state = 'single'
+                escaped_string = not postgres_mode or (pos > 0 and buf[pos-1] in 'Ee' and (pos == 1 or not (buf[pos-2].isalnum() or buf[pos-2] in '_$')))
             elif c == '"':
                 state = 'double'
             elif c == '`':
@@ -252,7 +262,7 @@ def iter_sql_stream(handle: TextIO, *, chunk_chars: int = CHUNK_CHARS,
             nxt = buf[pos + 1] if pos + 1 < len(buf) else ''
             if c == '\n':
                 line += 1
-            elif c == '\\' and state != 'backtick' and nxt:
+            elif c == '\\' and (state == 'single' and escaped_string or state == 'double' and not postgres_mode) and nxt:
                 if nxt == '\n':
                     line += 1
                 pos += 1

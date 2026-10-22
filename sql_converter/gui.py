@@ -8,7 +8,7 @@ from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal, Slot, QStandardPa
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QCompleter, QFileDialog, QFormLayout, QFrame, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QScrollArea, QLayout,
+    QHBoxLayout, QGridLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QScrollArea, QLayout,
     QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
@@ -90,9 +90,9 @@ class ConversionWorker(QObject):
 class Window(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('SQL 转换工具 · MySQL ↔ openGauss')
-        self.resize(1110, 830)
-        self.setMinimumSize(780, 560)
+        self.setWindowTitle('SQL 转换工具 · MySQL ↔ OpenGauss')
+        self.resize(1100, 870)
+        self.setMinimumSize(840, 590)
         folder = QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation)
         self.settings_path = Path(folder or str(Path.home() / '.sql-converter')) / 'mappings.json'
         self.custom_settings = load_overrides(self.settings_path)
@@ -117,64 +117,73 @@ class Window(QMainWindow):
         viewport.setWidget(root)
         layout = QVBoxLayout(root)
         layout.setSizeConstraint(QLayout.SetMinimumSize)
-        layout.setSpacing(14)
-        layout.setContentsMargins(20, 14, 20, 18)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 15, 20, 20)
         title = QLabel('SQL 转换工具')
         title.setStyleSheet('font-size: 22px; font-weight: 700;')
-        subtitle = QLabel('MySQL ↔ openGauss  ·  本地离线转换  ·  未支持语法会生成阻断报告')
+        subtitle = QLabel('MySQL ↔ OpenGauss  ·  本地离线转换  ·  无法安全处理的语法会记录在诊断报告中')
         subtitle.setObjectName('subtitle')
         layout.addWidget(title)
         layout.addWidget(subtitle)
 
         files = QGroupBox('文件与转换方向')
-        fv = QVBoxLayout(files)
-        row = QHBoxLayout()
+        file_grid = QGridLayout(files)
+        file_grid.setContentsMargins(14, 20, 14, 14)
+        file_grid.setHorizontalSpacing(10)
+        file_grid.setVerticalSpacing(10)
+        # All first-column labels and text controls share the same x origin.
+        file_grid.setColumnMinimumWidth(0, 90)
+        file_grid.setColumnStretch(1, 3)
+        file_grid.setColumnStretch(3, 2)
+        file_grid.setColumnMinimumWidth(4, 142)
+
+        def caption(label: str) -> QLabel:
+            item = QLabel(label)
+            item.setMinimumWidth(80)
+            item.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+            return item
+
         self.source_line = QLineEdit()
         self.source_line.setReadOnly(True)
         self.source_line.setPlaceholderText(f'选择本地 .sql 文件（最多 {MAX_SQL_FILE_BYTES // (1024 * 1024)} MiB）')
-        self.source_line.setToolTip('文件只在本地读取，不会上传服务器。超大 SQL 采用分块处理。')
+        self.source_line.setToolTip('SQL 仅在本地读取。大文件分块转换，不上传远程服务器。')
         choose = QPushButton('选择 SQL 文件')
         choose.clicked.connect(self._choose_input)
-        row.addWidget(self.source_line, 1)
-        row.addWidget(choose)
-        fv.addLayout(row)
-        row = QHBoxLayout()
-        row.addWidget(QLabel('转换方向'))
+        file_grid.addWidget(caption('SQL 文件'), 0, 0)
+        file_grid.addWidget(self.source_line, 0, 1, 1, 3)
+        file_grid.addWidget(choose, 0, 4)
+
         self.direction_box = QComboBox()
-        self.direction_box.addItem('MySQL  →  openGauss', 'mysql_to_opengauss')
-        self.direction_box.addItem('openGauss  →  MySQL', 'opengauss_to_mysql')
+        self.direction_box.addItem('MySQL  →  OpenGauss', 'mysql_to_opengauss')
+        self.direction_box.addItem('OpenGauss  →  MySQL', 'opengauss_to_mysql')
         self.direction_box.currentIndexChanged.connect(self._direction_changed)
-        row.addWidget(self.direction_box, 2)
-        row.addWidget(QLabel('文件编码'))
         self.encoding_box = QComboBox()
         self.encoding_box.addItem('自动检测（UTF-8 / GB18030）', 'auto')
         self.encoding_box.addItem('UTF-8', 'utf-8-sig')
         self.encoding_box.addItem('GB18030', 'gb18030')
-        row.addWidget(self.encoding_box, 2)
-        fv.addLayout(row)
-        row = QHBoxLayout()
+        file_grid.addWidget(caption('转换方向'), 1, 0)
+        file_grid.addWidget(self.direction_box, 1, 1)
+        file_grid.addWidget(caption('文件编码'), 1, 2)
+        file_grid.addWidget(self.encoding_box, 1, 3)
+
         self.folder_line = QLineEdit()
         self.folder_line.setReadOnly(True)
-        self.folder_line.setPlaceholderText('默认输出到原文件所在目录')
+        self.folder_line.setPlaceholderText('默认输出到原 SQL 所在目录')
         browse_folder = QPushButton('选择输出目录')
         browse_folder.clicked.connect(self._choose_folder)
-        row.addWidget(QLabel('输出路径'))
-        row.addWidget(self.folder_line, 1)
-        row.addWidget(browse_folder)
-        fv.addLayout(row)
-        row = QHBoxLayout()
-        name_label = QLabel('输出文件名')
-        name_label.setMinimumWidth(70)
+        file_grid.addWidget(caption('输出路径'), 2, 0)
+        file_grid.addWidget(self.folder_line, 2, 1, 1, 3)
+        file_grid.addWidget(browse_folder, 2, 4)
+
         self.output_name_line = QLineEdit()
-        self.output_name_line.setPlaceholderText('自动生成：原文件名_opengauss.sql（可修改）')
-        self.output_name_line.setToolTip('输入 .sql 文件名，不要包含目录。发生阻断时自动追加 _review，防止误当成完整脚本。')
+        self.output_name_line.setPlaceholderText('默认：原文件名_opengauss.sql（可自行修改）')
+        self.output_name_line.setToolTip('只填写文件名，需以 .sql 结尾。若有阻断，文件名自动加 _review。')
         self.output_name_line.textEdited.connect(self._name_edited)
         restore_name = QPushButton('使用默认名')
         restore_name.clicked.connect(self._restore_name)
-        row.addWidget(name_label)
-        row.addWidget(self.output_name_line, 1)
-        row.addWidget(restore_name)
-        fv.addLayout(row)
+        file_grid.addWidget(caption('输出文件名'), 3, 0)
+        file_grid.addWidget(self.output_name_line, 3, 1, 1, 3)
+        file_grid.addWidget(restore_name, 3, 4)
         layout.addWidget(files)
 
         maps = QGroupBox('数据类型映射（目标类型可搜索 / 下拉 / 手动修改）')
@@ -194,17 +203,18 @@ class Window(QMainWindow):
         self.map_table = QTableWidget(0, 3)
         self.map_table.setHorizontalHeaderLabels(['来源类型', '目标类型（可编辑）', '说明'])
         self.map_table.verticalHeader().setVisible(False)
-        self.map_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.map_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        self.map_table.setColumnWidth(0, 230)
         self.map_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.map_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.map_table.setAlternatingRowColors(True)
-        self.map_table.setMinimumHeight(280)
-        self.map_table.setMaximumHeight(280)
-        self.map_table.verticalHeader().setDefaultSectionSize(36)
+        self.map_table.setMinimumHeight(255)
+        self.map_table.setMaximumHeight(255)
+        self.map_table.verticalHeader().setDefaultSectionSize(33)
         self.map_table.setWordWrap(False)
-        self.map_table.setStyleSheet('QTableWidget::item { padding: 3px 5px; }')
+        self.map_table.setStyleSheet('QTableWidget { alternate-background-color: #EDF0F4; background: white; } QTableWidget::item { padding: 2px 7px; }')
         mv.addWidget(self.map_table)
-        hint = QLabel('映射可临时修改；点击“保存映射配置”后，会保存在本机用户配置目录。危险类型或特殊语法仍可能被阻断。')
+        hint = QLabel('映射可临时调整；点击“保存映射配置”后会写入本机用户配置目录。可能丢失精度或语义的转换仍会阻断或提示验证。')
         hint.setWordWrap(True)
         hint.setStyleSheet('color: #758398; font-size: 11px;')
         mv.addWidget(hint)
@@ -225,16 +235,23 @@ class Window(QMainWindow):
         runrow.addWidget(self.progress, 1)
         layout.addLayout(runrow)
 
+        layout.addSpacing(12)  # More space between progress bar and report section.
         results = QGroupBox('转换结果与语法报告')
         rv = QVBoxLayout(results)
+        rv.setContentsMargins(12, 20, 12, 13)
+        rv.setSpacing(7)
         self.status = QLabel('请先选择 SQL 文件。报告中的 BLOCKER 表示输出 SQL 仍需人工处理。')
         self.status.setWordWrap(True)
         self.status.setStyleSheet('color:#69788D;')
         rv.addWidget(self.status)
+        self.metrics_label = QLabel('耗时：—    平均处理速度：—')
+        self.metrics_label.setContentsMargins(12, 0, 0, 0)
+        self.metrics_label.setStyleSheet('color: #243247;')
+        rv.addWidget(self.metrics_label)
         self.report_text = QPlainTextEdit()
         self.report_text.setReadOnly(True)
         self.report_text.setPlaceholderText('完成后显示转换数量、阻断语法的位置以及输出文件路径。')
-        self.report_text.setMinimumHeight(155)
+        self.report_text.setMinimumHeight(140)
         self.report_text.setMaximumHeight(230)
         rv.addWidget(self.report_text, 1)
         buttons = QHBoxLayout()
@@ -293,9 +310,25 @@ class Window(QMainWindow):
         overrides = self.custom_settings.get(self._direction, {})
         self.map_table.setRowCount(len(rows))
         for i, row in enumerate(rows):
-            item = QTableWidgetItem(row.source)
-            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            self.map_table.setItem(i, 0, item)
+            stripe = '#FFFFFF' if i % 2 == 0 else '#EDF0F4'
+            source_cell = QWidget()
+            source_cell.setStyleSheet(f'background-color: {stripe};')
+            source_layout = QHBoxLayout(source_cell)
+            source_layout.setContentsMargins(8, 0, 8, 0)
+            source_layout.setSpacing(2)
+            text = row.source
+            has_unsigned = text.upper().endswith(' UNSIGNED')
+            left = QLabel(text[:-9].strip() if has_unsigned else text)
+            left.setStyleSheet('background: transparent;')
+            source_layout.addWidget(left)
+            if has_unsigned:
+                source_layout.addStretch(1)
+                right = QLabel('UNSIGNED')
+                right.setStyleSheet('background: transparent;')
+                right.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                source_layout.addWidget(right)
+            self.map_table.setCellWidget(i, 0, source_cell)
+
             combo = QComboBox()
             combo.setEditable(True)
             opts = list(dict.fromkeys([row.target, *row.choices, *DESTINATION_TYPES]))
@@ -307,16 +340,22 @@ class Window(QMainWindow):
             completer.setCompletionMode(QCompleter.PopupCompletion)
             combo.setCompleter(completer)
             combo.setCurrentText(overrides.get(row.source, row.target))
+            # Editing control blends with the same stripe as the source row.
+            combo.setStyleSheet(f"""QComboBox {{background: {stripe}; border: 0; border-radius: 0; padding: 3px 9px;}}
+            QComboBox:focus {{border: 1px solid #81B2EF; border-radius: 4px;}}
+            QComboBox QLineEdit {{background: {stripe}; border: 0; padding: 0;}}
+            QComboBox::drop-down {{border: 0; background: {stripe}; width: 22px;}}""")
             self.map_table.setCellWidget(i, 1, combo)
             note = QTableWidgetItem(row.note)
             note.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.map_table.setItem(i, 2, note)
+        self.map_table.setColumnWidth(0, 225)
         self._filter_mappings(self.search.text())
 
     def _filter_mappings(self, value: str):
         needle = value.strip().casefold()
         for i in range(self.map_table.rowCount()):
-            parts = [self.map_table.item(i, 0).text(),
+            parts = [default_rows(self._direction)[i].source,
                      self.map_table.cellWidget(i, 1).currentText(),
                      self.map_table.item(i, 2).text()]
             self.map_table.setRowHidden(i, bool(needle) and not any(needle in p.casefold() for p in parts))
@@ -368,6 +407,7 @@ class Window(QMainWindow):
         self.progress.setValue(0)
         self.status.setText('正在本机分析和转换 SQL，请稍候…')
         self.report_text.setPlainText('')
+        self.metrics_label.setText('耗时：—    平均处理速度：—')
         self.open_result.setEnabled(False)
         self.open_report.setEnabled(False)
         self._thread = QThread(self)
@@ -395,6 +435,7 @@ class Window(QMainWindow):
     def _cancelled(self):
         self.status.setText('转换已取消，没有生成不完整的 SQL 文件。')
         self.report_text.setPlainText('已取消，临时文件已清理。')
+        self.metrics_label.setText('耗时：—    平均处理速度：—')
 
     def _success(self, sql_path: str, report_path: str, report):
         self._result_file = sql_path
@@ -402,11 +443,13 @@ class Window(QMainWindow):
         self.progress.setValue(100)
         self.status.setText('转换结束 · 可在测试数据库验证' if report.ready else
                             f'转换结束 · {report.blocked} 条阻断语法，SQL 文件标记为 _review，不能直接当作完整迁移脚本')
+        self.metrics_label.setText(
+            f"耗时：{report.metrics.get('elapsed_seconds', 0):.2f} 秒    "
+            f"平均处理速度：{report.metrics.get('average_mib_per_second', 0):.2f} MiB/s")
         counts = Counter((f.severity, f.code) for f in report.findings)
         lines = [f'结果：{"完成静态转换（请在目标库测试）" if report.ready else "存在阻断，禁止直接导入"}',
                  f'SQL 文件：{sql_path}', f'报告文件：{report_path}',
                  f'语句总数：{report.total}   已转换：{report.converted}   跳过：{report.skipped}   阻断：{report.blocked}',
-                 f"耗时：{report.metrics.get('elapsed_seconds', 0):.2f} 秒   平均处理速度：{report.metrics.get('average_mib_per_second', 0):.2f} MiB/s",
                  '', '问题摘要（相同类别合并显示）：']
         if not counts:
             lines.append('  无问题')
@@ -431,6 +474,7 @@ class Window(QMainWindow):
     def _failure(self, message: str):
         self.status.setText('转换失败，未生成有效结果。')
         self.report_text.setPlainText(message)
+        self.metrics_label.setText('耗时：—    平均处理速度：—')
         QMessageBox.critical(self, '转换失败', message)
 
     def _finished(self):
