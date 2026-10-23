@@ -271,6 +271,27 @@ def _convert_mysql_index_columns(fields: str, ctx: Context) -> tuple[str, bool]:
     return (', '.join(converted) if expression_found else ','.join(converted)), expression_found
 
 
+def _portable_constraint_columns(fields: str) -> tuple[str, bool]:
+    """Convert validated, simple index key-parts to CREATE TABLE key columns.
+
+    PostgreSQL/openGauss table-level UNIQUE/PRIMARY KEY constraints only accept
+    column names, not the ASC/DESC options accepted by CREATE INDEX. Dropping
+    explicit ASC is safe (the default order); descending sort is reported to
+    the caller so it can be emitted as a separate indexed object or blocked.
+    """
+    columns = []
+    descending = False
+    for field in split_top_level(fields):
+        m = re.fullmatch(r'\s*(`(?:[^`]|``)+`|"(?:[^"]|"")+"|[A-Za-z_][\w$]*)\s*(ASC|DESC)?\s*', field, re.I)
+        if not m:
+            raise UnsupportedSQL('CONSTRAINT_KEY_PART', '唯一约束或主键包含不支持的索引列、表达式或排序参数')
+        columns.append(m.group(1))
+        descending |= bool(m.group(2) and m.group(2).upper() == 'DESC')
+    if not columns:
+        raise UnsupportedSQL('CONSTRAINT_KEY_PART', '唯一约束或主键缺少字段')
+    return ','.join(columns), descending
+
+
 def _strip_mysql_column_collation(attributes: str, ctx: Context) -> str:
     """Remove MySQL-only column encoding declarations with explicit risk note."""
     charset = re.findall(r'\bCHARACTER\s+SET\s+([A-Za-z0-9_]+)', attributes, re.I)
@@ -379,8 +400,15 @@ class CreateTableRule(Rule):
                     raise UnsupportedSQL('HASH_INDEX', '非 BTREE 索引需要独立规则')
                 column_sql, expression = _convert_mysql_index_columns(fields, ctx)
                 if unique and not expression:
-                    # A plain-column UNIQUE KEY is a constraint; keep its name.
-                    cols.append(f'CONSTRAINT {_identifier(name, ctx)} UNIQUE ({column_sql})')
+                    # CREATE TABLE UNIQUE (...) accepts only column names, not
+                    # the MySQL index modifiers ASC/DESC. ASC is redundant.
+                    constraint_columns, descending = _portable_constraint_columns(column_sql)
+                    if not descending:
+                        cols.append(f'CONSTRAINT {_identifier(name, ctx)} UNIQUE ({constraint_columns})')
+                    else:
+                        # Keep explicit DESC on an independent UNIQUE index.
+                        indexes.append(f'CREATE UNIQUE INDEX {_identifier(name, ctx)} ON {_identifier(tbl, ctx)} ({column_sql});')
+                        ctx.warning('UNIQUE_DESC_INDEX', '唯一索引包含 DESC，已生成独立 CREATE UNIQUE INDEX 保留排序方向；需在目标库核对索引行为')
                 else:
                     kind = 'CREATE UNIQUE INDEX' if unique else 'CREATE INDEX'
                     indexes.append(f'{kind} {_identifier(name, ctx)} ON {_identifier(tbl, ctx)} ({column_sql});')
@@ -394,10 +422,30 @@ class CreateTableRule(Rule):
                     raise UnsupportedSQL('COMPLEX_CONSTRAINT', '复杂约束需要额外转换规则')
                 elem = re.sub(r'\bUNIQUE\s+KEY\b', 'UNIQUE', elem, flags=re.I)
                 elem = re.sub(r'\bPRIMARY\s+KEY\s+USING\s+BTREE\b', 'PRIMARY KEY', elem, flags=re.I)
-                # MySQL permits USING BTREE after a PRIMARY KEY declaration,
-                # whereas the generated openGauss constraint does not.
+                # MySQL permits USING BTREE after a PRIMARY KEY declaration.
                 elem = re.sub(r'\s+USING\s+BTREE\s*$', '', elem, flags=re.I)
-                cols.append(ctx.quotes(elem))
+                key = re.fullmatch(
+                    r'(?:(CONSTRAINT\s+[`"\w$]+)\s+)?(PRIMARY\s+KEY|UNIQUE)\s*\((.*)\)',
+                    elem, re.I | re.S)
+                if key:
+                    constraint_name, kind, raw_parts = key.groups()
+                    normalized, expression = _convert_mysql_index_columns(raw_parts, ctx)
+                    if expression:
+                        raise UnsupportedSQL('CONSTRAINT_EXPRESSION', '表达式索引不能放在表级 UNIQUE/PRIMARY KEY 约束中')
+                    key_columns, descending = _portable_constraint_columns(normalized)
+                    if descending:
+                        if kind.upper().startswith('PRIMARY'):
+                            raise UnsupportedSQL('PRIMARY_KEY_DESC', '主键含 DESC 排序，需要保留主键与索引语义的专项规则')
+                        if not constraint_name:
+                            raise UnsupportedSQL('UNNAMED_UNIQUE_DESC', '无名称的 UNIQUE 约束含 DESC，无法安全保留排序与索引名称')
+                        idx_name = re.sub(r'^CONSTRAINT\s+', '', constraint_name, flags=re.I)
+                        indexes.append(f'CREATE UNIQUE INDEX {_identifier(idx_name, ctx)} ON {_identifier(tbl, ctx)} ({normalized});')
+                        ctx.warning('UNIQUE_DESC_INDEX', '唯一约束包含 DESC，已生成独立 CREATE UNIQUE INDEX；请核对索引行为')
+                    else:
+                        prefix = f'{ctx.quotes(constraint_name)} ' if constraint_name else ''
+                        cols.append(f'{prefix}{kind.upper()} ({key_columns})')
+                else:
+                    cols.append(ctx.quotes(elem))
                 continue
             m = re.match(r'^([`"\w$]+)\s+(.+)$', elem, re.S)
             if not m:

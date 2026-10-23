@@ -174,3 +174,10 @@ python -m benchmarks.benchmark_conversion --size-mib 20
 - **不是**取消 32 MiB 单语句安全上限：如果确实存在超过该限制的一条 INSERT，仍会阻断并报告；不建议自动截断或任意按行拆分。
 - 本次新增与修复细节见 [UPDATE_V2_4.md](UPDATE_V2_4.md)。生成的 SQL 必须在对应数据库版本的**测试库**验证，尤其是字符序、表达式唯一索引以及真实数据。
 
+
+### v2.5 · PostgreSQL/OpenGauss UNIQUE 语法修复
+
+- 表级 `UNIQUE (a ASC, b ASC)` 已修正为 `UNIQUE (a,b)`；主键列上的多余 `ASC` 同样处理。
+- 显式 `DESC` 的具名唯一索引通过独立 `CREATE UNIQUE INDEX` 保留排序；普通 `CREATE INDEX` 不受影响。
+- 具备新的语法回归测试与 `samples/postgres_constraint_smoke.sql`；参阅 [`UPDATE_V2_5.md`](UPDATE_V2_5.md)。
+- 仍需在目标数据库版本实际验证，静态 `0 BLOCKER` 不等于数据库执行成功。
