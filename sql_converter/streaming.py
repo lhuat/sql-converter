@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 from typing import Callable, Iterator, TextIO
 
-from .scanner import Statement
+from .scanner import Statement, is_navicat_escaped_empty_literal
 
 # App file-size policy: 500 MiB (524,288,000 bytes), inclusive.
 MAX_SQL_FILE_BYTES = 500 * 1024 * 1024
@@ -153,7 +153,6 @@ _QUOTED_EVENTS = {
 }
 _DOLLAR_OPEN = re.compile(r'\$[a-zA-Z_0-9]*\$')
 
-
 def iter_sql_stream(handle: TextIO, *, chunk_chars: int = CHUNK_CHARS,
                     postgres_mode: bool = False,
                     max_statement_bytes: int = MAX_STATEMENT_BYTES,
@@ -174,6 +173,7 @@ def iter_sql_stream(handle: TextIO, *, chunk_chars: int = CHUNK_CHARS,
     state = 'normal'
     dollar_tag = ''
     escaped_string = True
+    previous_tail = ''  # lexical lookbehind across 1 MiB reader boundaries
     parts: list[str] = []
     length = 0
     oversized = False
@@ -195,6 +195,7 @@ def iter_sql_stream(handle: TextIO, *, chunk_chars: int = CHUNK_CHARS,
         limit = len(buf) if eof else max(0, len(buf) - LOOKAHEAD_CHARS)
         if pos >= limit and not eof:
             append(buf[begin:pos])
+            previous_tail = (previous_tail + buf[max(0, pos - 32):pos])[-64:]
             consumed += pos
             if on_chars:
                 on_chars(consumed)
@@ -216,6 +217,16 @@ def iter_sql_stream(handle: TextIO, *, chunk_chars: int = CHUNK_CHARS,
             if c == '\n':
                 line += 1
             elif c == "'":
+                # Accept only the *paired*, charset-introduced escaped empty
+                # literal found in Navicat expression-index DDL, never a
+                # general backslash-quote outside a string. Both apostrophes
+                # belong to that one token; their SQL normalization happens
+                # later in mysql_compat and produces a diagnostic.
+                if is_navicat_escaped_empty_literal(
+                    previous_tail + buf[max(0, pos - 40):pos], buf[pos + 1:pos + 3],
+                    postgres_mode=postgres_mode):
+                    pos += 3
+                    continue
                 state = 'single'
                 escaped_string = not postgres_mode or (pos > 0 and buf[pos-1] in 'Ee' and (pos == 1 or not (buf[pos-2].isalnum() or buf[pos-2] in '_$')))
             elif c == '"':

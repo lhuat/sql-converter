@@ -15,6 +15,21 @@ class Statement:
     unterminated: bool = False
 
 
+_NAVICAT_EMPTY_LITERAL_PREFIX = re.compile(
+    r'(?i)(?<![A-Za-z0-9_$])_(?:utf8mb4|utf8mb3|utf8)\\$'
+)
+
+
+def is_navicat_escaped_empty_literal(before: str, after: str, *, postgres_mode: bool = False) -> bool:
+    """Detect only a paired, charset-introduced Navicat empty-string escape.
+
+    `before` ends before the first apostrophe, while `after` starts directly
+    after it. This must not apply inside quoted strings or in OpenGauss SQL.
+    """
+    return bool(not postgres_mode and after.startswith("\\'") and
+                _NAVICAT_EMPTY_LITERAL_PREFIX.search(before[-40:]))
+
+
 def split_sql(text: str, *, postgres_mode: bool = False) -> list[Statement]:
     statements: list[Statement] = []
     start = 0
@@ -31,6 +46,10 @@ def split_sql(text: str, *, postgres_mode: bool = False) -> list[Statement]:
             line += 1
         if state == 'normal':
             if c == "'":
+                if is_navicat_escaped_empty_literal(text[max(0, i - 40):i], text[i + 1:i + 3],
+                                                    postgres_mode=postgres_mode):
+                    i += 3  # Both paired apostrophes are lexical data, not delimiters.
+                    continue
                 state = 'single'
                 escaped_string = not postgres_mode or (i > 0 and text[i-1] in 'Ee' and (i == 1 or not (text[i-2].isalnum() or text[i-2] in '_$'))) 
             elif c == '"':

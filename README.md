@@ -163,3 +163,14 @@ python -m benchmarks.benchmark_conversion --size-mib 20
 ## v2.3 GUI 布局修复
 
 参见 [UPDATE_V2_3.md](UPDATE_V2_3.md)。本次只调整界面布局与文字，不修改 SQL 解析/转换引擎。
+
+
+## v2.4 真实大文件误报修复与批量 INSERT 加速
+
+- 修复 Navicat `CASE WHEN` 条件唯一索引中 `_utf8mb4\\'\\'` 特殊写法触发的**错误 SQL 跨语句合并**；仅限识别出的字符集空字符串写法，不会全局修改数据里的反斜杠。修复会记录 `NAVICAT_ESCAPED_EMPTY_LITERAL`，便于核对索引语义。
+- `scanner.py` 和 `streaming.py` 使用一致的词法识别，对转换入口和测试入口均生效。
+- 对符合严格安全语法的普通 `INSERT ... VALUES` 提供快速处理，其他插入语句仍使用原有严格规则；MySQL → OpenGauss 与 OpenGauss → MySQL 都适用。
+- 经上传的真实 268.73 MiB SQL 进行全文件验证，识别 **672,390 条语句**，静态 MySQL → OpenGauss **0 BLOCKER**，本地处理耗时 **34.4 秒**（仅本次环境参考）。
+- **不是**取消 32 MiB 单语句安全上限：如果确实存在超过该限制的一条 INSERT，仍会阻断并报告；不建议自动截断或任意按行拆分。
+- 本次新增与修复细节见 [UPDATE_V2_4.md](UPDATE_V2_4.md)。生成的 SQL 必须在对应数据库版本的**测试库**验证，尤其是字符序、表达式唯一索引以及真实数据。
+

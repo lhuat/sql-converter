@@ -199,3 +199,84 @@ def validate_case_index_expression(expr: str) -> str:
     # SQL keywords are normalized only outside quoted values here.
     e = re.sub(r'(?i)\b(case|when|then|else|end)\b', lambda m:m.group().upper(), e)
     return '('+e+')'
+
+
+# Navicat can serialize a CASE-expression index comparison with
+# `_utf8mb4\\'\\'` rather than `_utf8mb4''`. This is not a general MySQL
+# escape rule: rewrite only an *empty literal* on a recognized index DDL line.
+_NAVICAT_DDL_INDEX = re.compile(r'^\s*(?:UNIQUE\s+)?(?:INDEX|KEY)\b', re.I)
+_NAVICAT_EMPTY_LITERAL = re.compile(
+    r"(?i)(?<![A-Za-z0-9_$])(_utf8mb4|_utf8mb3|_utf8)\\'\\'(?=\s*[)\s])"
+)
+
+
+def normalize_navicat_index_quirk(sql: str) -> tuple[str, int]:
+    """Repair only Navicat's escaped empty charset string in CASE index DDL.
+
+    Never rewrite user INSERT data or arbitrary quoted text. Other invalid
+    backslash quotes remain unsupported instead of being guessed about.
+    """
+    if "\\'\\'" not in sql or not re.search(r'\bCREATE\s+TABLE\b', sql, re.I):
+        return sql, 0
+    updated: list[str] = []
+    changes = 0
+    for line in sql.splitlines(keepends=True):
+        if _NAVICAT_DDL_INDEX.match(line) and re.search(r'\bCASE\s+WHEN\b', line, re.I):
+            # The literal is accepted only in the WHERE-like boolean condition
+            # before THEN; it cannot be a user string attribute/comment.
+            marker = re.search(r'\bTHEN\b', line, re.I)
+            if marker:
+                condition = line[:marker.start()]
+                condition, n = _replace_escaped_index_literals_outside_strings(condition)
+                line = condition + line[marker.start():]
+                changes += n
+        updated.append(line)
+    return ''.join(updated), changes
+
+
+def _replace_escaped_index_literals_outside_strings(text: str) -> tuple[str, int]:
+    """Rewrite the exact known token only outside quotes and SQL comments."""
+    out: list[str] = []
+    i = 0
+    start = 0
+    state = 'normal'
+    count = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        nxt = text[i + 1] if i + 1 < n else ''
+        if state == 'normal':
+            match = _NAVICAT_EMPTY_LITERAL.match(text, i)
+            if match:
+                out.append(text[start:i])
+                out.append(match.group(1) + "''")
+                count += 1
+                i = match.end()
+                start = i
+                continue
+            if c in ('\"', "'", '`'):
+                state = c
+            elif c == '/' and nxt == '*':
+                state = 'block_comment'
+                i += 1
+            elif c == '-' and nxt == '-' and (i + 2 >= n or text[i + 2].isspace()):
+                state = 'line_comment'
+                i += 1
+        elif state == 'block_comment':
+            if c == '*' and nxt == '/':
+                state = 'normal'
+                i += 1
+        elif state == 'line_comment':
+            if c == '\n':
+                state = 'normal'
+        else:
+            if c == '\\' and state == "'":
+                i += 1
+            elif c == state:
+                if nxt == state:
+                    i += 1
+                else:
+                    state = 'normal'
+        i += 1
+    out.append(text[start:])
+    return ''.join(out), count

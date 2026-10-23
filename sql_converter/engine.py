@@ -16,7 +16,7 @@ import os
 import tempfile
 import time
 
-from .mysql_compat import normalize_mysql_literals, validate_case_index_expression, LiteralConversionError
+from .mysql_compat import normalize_mysql_literals, normalize_navicat_index_quirk, validate_case_index_expression, LiteralConversionError
 from .pg_compat import normalize_postgres_literals, rewrite_simple_postgres_casts, PostgresLiteralError
 from .mappings import replace_type
 from .streaming import (MAX_SQL_FILE_BYTES, MAX_STATEMENT_BYTES, validate_file_size,
@@ -767,6 +767,47 @@ RULES: tuple[Rule, ...] = (
 )
 
 
+# Strict C-regex subset for high-volume, plain dump INSERTs.
+# Other statements retain the full conservative dialect pipeline. In particular
+# any escapes, functions, expressions, COPY, casts, binary literals, subqueries
+# or very long INSERTs fall back to the existing checked conversion path.
+_FAST_LITERAL = r"(?:NULL|TRUE|FALSE|[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?|'(?:''|[^'\\])*')"
+_FAST_ROW = rf"\(\s*{_FAST_LITERAL}(?:\s*,\s*{_FAST_LITERAL})*\s*\)"
+_FAST_ROWS = re.compile(rf"\s*{_FAST_ROW}(?:\s*,\s*{_FAST_ROW})*\s*;?\s*\Z", re.S)
+_FAST_IDENT_MYSQL = r'`(?:``|[^`])+`'
+_FAST_IDENT_PG = r'"(?:""|[^"])+"'
+_FAST_INSERT_HEADERS = {
+    'mysql_to_opengauss': re.compile(
+        rf'^INSERT\s+INTO\s+({_FAST_IDENT_MYSQL})\s+VALUES\s+', re.I),
+    'opengauss_to_mysql': re.compile(
+        rf'^INSERT\s+INTO\s+({_FAST_IDENT_PG})\s+VALUES\s+', re.I),
+}
+
+
+def _fast_plain_insert(sql: str, ctx: Context) -> str | None:
+    """Translate the exact simple VALUES grammar without Python per-value work.
+
+    This is a semantics-preserving subset: only unescaped single-quoted text,
+    finite ordinary numeric tokens and NULL/TRUE/FALSE. It cannot bypass any
+    dialect-specific handling, custom type mapping, or BYTEA transformation.
+    """
+    if len(sql) > 8192:
+        return None
+    m = _FAST_INSERT_HEADERS[ctx.direction].match(sql)
+    if not m:
+        return None
+    if ctx.direction == 'opengauss_to_mysql':
+        table = ctx.quotes(m.group(1)).casefold()
+        if ctx.report._binary_columns.get(table):
+            return None
+    payload = sql[m.end():]
+    if _FAST_ROWS.fullmatch(payload) is None:
+        return None
+    # Identifiers are the ONLY quoted tokens changed. Raw values have already
+    # passed a strict grammar that rules out strings with backslash escapes.
+    return 'INSERT INTO ' + ctx.quotes(m.group(1)) + ' VALUES ' + payload.strip().removesuffix(';').rstrip() + ';'
+
+
 def _process_statement(stmt: Statement, direction: str, mappings: dict[str, str], report: Report) -> str | None:
     """Run one statement through the same rules for text and file conversion."""
     if stmt.too_large:
@@ -783,7 +824,21 @@ def _process_statement(stmt: Statement, direction: str, mappings: dict[str, str]
     source_line = stmt.line + stmt.sql[:relative].count('\n') if relative >= 0 else stmt.line
     ctx = Context(direction, mappings, report, source_line)
     try:
+        fast = _fast_plain_insert(source, ctx)
+        if fast is not None and not stmt.unterminated:
+            report.converted += 1
+            return fast
         if direction == 'mysql_to_opengauss':
+            source, repaired = normalize_navicat_index_quirk(source)
+            if repaired:
+                # Report the actual index line, not just CREATE TABLE's start.
+                issue_line = source_line
+                for m in re.finditer(r'(?mi)^\s*UNIQUE\s+(?:INDEX|KEY)\b[^\n]*', stmt.sql):
+                    if "\\'\\'" in m.group(0):
+                        issue_line = stmt.line + stmt.sql[:m.start()].count('\n')
+                        break
+                report.add('WARNING', 'NAVICAT_ESCAPED_EMPTY_LITERAL', issue_line,
+                           f'检测到 {repaired} 处 Navicat 表达式索引空字符串异常转义，已限定规则修正；请核验索引语义')
             source, _ = normalize_mysql_literals(source)
         else:
             # PostgreSQL ordinary strings treat backslash literally, and E''
